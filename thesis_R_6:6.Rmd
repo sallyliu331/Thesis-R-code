@@ -1,0 +1,569 @@
+---
+title: "R Notebook"
+output: html_notebook
+author: Shijia Liu
+---
+
+Library packages:
+```{r}
+library(data.table)
+library(ggplot2)
+library(forcats)
+library(rsample)
+library(dplyr)
+library(xts)
+```
+
+Input data:
+```{r}
+mydata = read.csv("/Users/liushijia/Users/liushijia/Desktop/thesisdata/thesisdata.csv", header = TRUE)
+```
+
+# Data Cleaning
+
+```{r}
+# delete since this variable carries no information
+mydata$X <- NULL
+
+# delete since tenure is not accurate (use active year "actyear" instead, which measures total number of years that a customer made transactions)
+mydata$tenure <- NULL
+
+# delete shopping carts variable since we focus on the total spending instead
+mydata$nb_carts_14 <- NULL
+mydata$nb_carts_15 <- NULL
+mydata$nb_carts_16 <- NULL
+mydata$nb_carts_17 <- NULL
+mydata$nb_carts_18 <- NULL
+mydata$nb_carts_19 <- NULL
+mydata$nb_carts_14_father <- NULL
+mydata$nb_carts_15_father <- NULL
+mydata$nb_carts_16_father <- NULL
+mydata$nb_carts_17_father <- NULL
+mydata$nb_carts_18_father <- NULL
+mydata$nb_carts_19_father <- NULL
+
+# change NAs in spend & visiting_days & visiting_friends of each year to 0
+mydata[, 15:32][is.na(mydata[, 15:32])] <- 0
+```
+
+
+```{r}
+# sum total number of visiting days & visiting friends (referral program) page, delete number of each year
+# #1 new variable created: sumvdays
+mydata$sumvdays <- mydata$visiting_days_14 + mydata$visiting_days_15 + mydata$visiting_days_16 + mydata$visiting_days_17 + mydata$visiting_days_18 + mydata$visiting_days_19
+mydata$visiting_days_14 <- NULL
+mydata$visiting_days_15 <- NULL
+mydata$visiting_days_16 <- NULL
+mydata$visiting_days_17 <- NULL
+mydata$visiting_days_18 <- NULL
+mydata$visiting_days_19 <- NULL
+
+# #2 new variable created: sumvfriends
+mydata$sumvfriends <- mydata$visiting_friends_14 + mydata$visiting_friends_15 + mydata$visiting_friends_16 + mydata$visiting_friends_17 + mydata$visiting_friends_18 + mydata$visiting_friends_19
+mydata$visiting_friends_14 <- NULL
+mydata$visiting_friends_15 <- NULL
+mydata$visiting_friends_16 <- NULL
+mydata$visiting_friends_17 <- NULL
+mydata$visiting_friends_18 <- NULL
+mydata$visiting_friends_19 <- NULL
+
+# delete NPS variable since it contains too many NAs
+mydata$NPS <- NULL
+```
+
+```{r}
+# #3 new variable created: totalspend_father
+mydata$totalspend_father <- mydata$spend_14_father + mydata$spend_15_father + mydata$spend_16_father + mydata$spend_17_father + mydata$spend_18_father + mydata$spend_19_father
+
+# #4 new variable created: actyear
+# calculate the active year for each customer (years that the customer has spent money)
+mydata$actyear <- rowSums(mydata[,15:20]!=0)
+```
+
+
+```{r}
+mydata[, 30:35][is.na(mydata[, 30:35])] <- 0
+mydata$actyear_father <- rowSums(mydata[,30:35]!=0)
+
+# delete fathers' data, only keep fathers': FirstOrderDate, LastOrderDate, actyear, totalspend
+mydata <- mydata[, -c(22:27)]
+mydata <- mydata[, -c(24:43)]
+```
+
+
+## data preparation
+
+```{r}
+# To calculate CRV, we only focus on records that the customer is on the referral chain (that is, either referred or referring others)
+referdata <- mydata[which(mydata$referred ==1 | mydata$referring ==1), ]
+```
+
+```{r}
+# assign ID and Father ID to dataframe
+referdata_children <- unique(referdata[13:14]) # composite key: (firstorderdate, last orderdate)
+referdata_fathers<- unique(referdata[22:23])
+names(referdata_fathers) = gsub(pattern = "_father", replacement = "", x = names(referdata_fathers))
+
+referdata_all <- rbind(referdata_children, referdata_fathers)
+referdata_all<- unique(referdata_all)
+
+# assign ID to each customer (unique combination of (firstorderdate, last orderdate))
+referdata_all$ID <- 1:nrow(referdata_all)
+
+# assign ID and father_ID to every record in the table "referdata"
+
+# assign ID to every record in the table "referdata"
+referdata <- setDT(referdata)[setDT(referdata_all), ID := i.ID, on=c("FirstOrderDate", "LastOrderDate")]
+
+names(referdata_all)[names(referdata_all) == 'FirstOrderDate'] <- 'FirstOrderDate_father'
+names(referdata_all)[names(referdata_all) == 'LastOrderDate'] <- 'LastOrderDate_father'
+names(referdata_all)[names(referdata_all) == 'ID'] <- 'father_ID'
+
+# assign father_ID to every record in the table "referdata"
+referdata <- setDT(referdata)[setDT(referdata_all), father_ID := i.father_ID, on=c("FirstOrderDate_father", "LastOrderDate_father")]
+
+# remove tables
+rm(referdata_all)
+rm(referdata_children)
+rm(referdata_fathers)
+```
+
+
+
+
+# Data exploration
+
+## general data overview (not including referral behavior)
+
+### summary of data
+
+```{r}
+summary(mydata)
+
+# the mean of referring is 0.043: 4.3% of the customers referred others
+
+# median of meanspend is 95 : the median customer spend 95 euros per year.
+# mean of meanspend is 236 : on average customer spend 236 euros per year.
+
+# median of totalspend is 127 : the median customer spend 127 euros in total.
+# mean of totalspend is 236 : on average customer spend 629 euros in total.
+
+# optin: more customers allow the company to send promotion information to them
+
+# median of sumvdays is 70 : the median customer visit website 70 days in total.
+# mean of sumvdays is 182 : on average customer visit website 182 days in total.
+
+# median of sumvfriends is 0: the median customer do not visit referral page.
+# mean of sumvfriends is 1: on average customer visit referral page 1 time.
+
+```
+
+### customer acquisition source
+
+number of cusotmers generated:
+
+```{r}
+# plot customers generated by each acquisition source:
+ggplot(data.frame(mydata), aes(fct_infreq(acquisition_source))) + geom_bar()
+
+nrow(mydata[which(mydata$acquisition_source == "Direct"),]) #= 340,432, 340432/551246=62%
+nrow(mydata[which(mydata$acquisition_source == "Paid Search"),]) #= 92,250
+nrow(mydata[which(mydata$acquisition_source == "Paid Social"),]) #= 58,673
+nrow(mydata[which(mydata$acquisition_source == "Other"),]) #= 32,328
+nrow(mydata[which(mydata$acquisition_source == "Member Get Member"),]) #=26,146
+nrow(mydata[which(mydata$acquisition_source == "Organic Social"),]) #= 1,417
+# most customers are generate through Direct source (62%).
+# paid search + paid social media generate 28% customers (17% + 11%)
+# referral program generated 4.7% of the customers.
+```
+average totalspend & mean spend of customer from different acquisition source:
+
+```{r}
+mean(mydata$totalspend[mydata$acquisition_source == "Paid Search"])
+mean(mydata$totalspend[mydata$acquisition_source == "Other"])
+mean(mydata$totalspend[mydata$acquisition_source == "Organic Social"])
+mean(mydata$totalspend[mydata$acquisition_source == "Direct"])
+mean(mydata$totalspend[mydata$acquisition_source == "Paid Social"])
+mean(mydata$totalspend[mydata$acquisition_source == "Member Get Member"])
+
+mean(mydata$meanspend[mydata$acquisition_source == "Paid Search"])
+mean(mydata$meanspend[mydata$acquisition_source == "Other"])
+mean(mydata$meanspend[mydata$acquisition_source == "Organic Social"])
+mean(mydata$meanspend[mydata$acquisition_source == "Direct"])
+mean(mydata$meanspend[mydata$acquisition_source == "Paid Social"])
+mean(mydata$meanspend[mydata$acquisition_source == "Member Get Member"])
+
+# customer generated through referral program have least total spend & mean spend among customers acquired through other channels
+```
+
+### customer gender
+
+```{r}
+# plot customer gender:
+ggplot(data.frame(mydata), aes(fct_infreq(gender))) + geom_bar()
+# Female is more than male
+```
+
+### customer region
+
+```{r}
+# plot customer region (split BE-NL,BE-FR, NL-NL):
+ggplot(data.frame(mydata), aes(fct_infreq(region))) + geom_bar()
+# in detail: cusotmers from Belgium dutch area > Netherlands > Belgium french area
+```
+
+
+```{r}
+# calculate number of customers from Belgium and Netherlands respectively
+nrow(mydata[which(mydata$region == "BE-NL" | mydata$region == "BE-FR"),]) # Belgium customers= 361890 361890/551246= 66%
+nrow(mydata[which(mydata$region == "NL-NL"),]) # Netherlands customers= 189356 189356/551246= 34%
+#there are 66% customers come from Belgium, 34% customers come from Netherlands.
+```
+
+### customer spend for each year analysis:
+
+```{r}
+# the mean of spend increase each year.
+mean(mydata$spend_14[mydata$spend_14 != 0])
+mean(mydata$spend_15[mydata$spend_15 != 0])
+mean(mydata$spend_16[mydata$spend_16 != 0])
+mean(mydata$spend_17[mydata$spend_17 != 0])
+mean(mydata$spend_18[mydata$spend_18 != 0])
+mean(mydata$spend_19[mydata$spend_19 != 0])
+```
+
+### active year & acquisition source analysis
+
+```{r}
+# customers from which aquisition source stay longest
+mean(mydata$actyear[mydata$acquisition_source == "Paid Search"])
+mean(mydata$actyear[mydata$acquisition_source == "Organic Social"])
+mean(mydata$actyear[mydata$acquisition_source == "Other"])
+mean(mydata$actyear[mydata$acquisition_source == "Direct"])
+mean(mydata$actyear[mydata$acquisition_source == "Paid Social"])
+mean(mydata$actyear[mydata$acquisition_source == "Member Get Member"])
+# surprisingly, customers who are referred by others are active least years than all other acquisition sources
+```
+
+## overview of referral behaviors
+
+### referral chain analysis:
+
+```{r}
+nrow(mydata[which(mydata$referred ==1 | mydata$referring ==1),]) / 551246
+# in total there are 8.5% of the customers involved in the referral chain
+```
+
+### referred and referral analysis:
+
+```{r}
+# probability of referring among referred customers and non-referred customers
+mean(mydata$referring[mydata$referred == 1])/mean(mydata$referring[mydata$referred == 0])
+# thus referred customers are 3 times more likely to refer customers
+```
+
+### customer acquisition source and referral analysis:
+
+```{r}
+# referring probability though each acquisition channel:
+nrow(mydata[which(mydata$acquisition_source == "Direct" & mydata$referring == 1),])/nrow(mydata[which(mydata$acquisition_source == "Direct"),])
+
+nrow(mydata[which(mydata$acquisition_source == "Paid Search" & mydata$referring == 1),])/nrow(mydata[which(mydata$acquisition_source == "Paid Search"),])
+
+nrow(mydata[which(mydata$acquisition_source == "Paid Social" &  mydata$referring == 1),])/nrow(mydata[which(mydata$acquisition_source == "Paid Social"),])
+
+nrow(mydata[which(mydata$acquisition_source == "Other" & mydata$referring == 1),])/nrow(mydata[which(mydata$acquisition_source == "Other"),])
+
+nrow(mydata[which(mydata$acquisition_source == "Member Get Member" & mydata$referring == 1),])/nrow(mydata[which(mydata$acquisition_source == "Member Get Member"),])
+
+nrow(mydata[which(mydata$acquisition_source == "Organic Social" & mydata$referring == 1),])/nrow(mydata[which(mydata$acquisition_source == "Organic Social"),])
+
+# customer who are referred by others (whose acquisition source is "Member Get Member")  are most likely to refer others, 
+# customers come from "Direct" source are least likely to refer others.
+```
+
+### customer gender & referral analysis:
+
+```{r}
+nrow(mydata[which(mydata$gender == "F" & mydata$referring == 1),])/nrow(mydata[which(mydata$gender == "F"),])
+nrow(mydata[which(mydata$gender == "M" & mydata$referring == 1),])/nrow(mydata[which(mydata$gender == "M"),])
+# Female and Male are almost equally likely to refer others, with probability of referral for Female is 5% more than Male
+```
+
+### customer region & referral analysis:
+
+```{r}
+nrow(mydata[which(mydata$region == "BE-NL" & mydata$referring == 1),])/nrow(mydata[which(mydata$region == "BE-NL"),])
+nrow(mydata[which(mydata$region == "BE-FR" & mydata$referring == 1),])/nrow(mydata[which(mydata$region == "BE-FR"),])
+nrow(mydata[which(mydata$region == "NL-NL" & mydata$referring == 1),])/nrow(mydata[which(mydata$region == "NL-NL"),])
+# comparing the referral rate across regions: 
+# NL > BE-FR > BE-NL
+# thus, customers from Netherlands are more likely to refer others than customers from Belgium.
+```
+
+### visit of referral page and referral behavior analysis:
+
+```{r}
+mydata$if_vfriends <- ifelse(mydata$sumvfriends > 0 , 1, 0)
+
+nrow(mydata[which(mydata$if_vfriends ==0 & mydata$referring ==1),])/nrow(mydata[which(mydata$if_vfriends ==0),])
+nrow(mydata[which(mydata$if_vfriends ==1 & mydata$referring ==1),])/nrow(mydata[which(mydata$if_vfriends ==0),])
+# if a customer visit friends page is correlated with if he/she refer others
+```
+
+### total spend & referred/referral behavior analysis:
+
+```{r}
+mean(mydata$totalspend[mydata$referred == 0 & mydata$referring == 0])
+mean(mydata$totalspend[mydata$referred == 0 & mydata$referring == 1])
+mean(mydata$totalspend[mydata$referred == 1 & mydata$referring == 1])
+mean(mydata$totalspend[mydata$referred == 1 & mydata$referring == 0])
+# customers acquired not through referral program but referred others are those spend the most (2189 euros)
+# customers acquired through referral program but not refer others are those spend the least (189 euros)
+# customers who are not on the referral chain spend 586 euros on average
+# customers who are referred and refer others spend 573 euros on average
+```
+
+
+```{r}
+# are referred customers more profitable than non referred customers
+mean(mydata$meanspend[mydata$referred == 0]) #= 243
+mean(mydata$meanspend[mydata$referred == 1]) #= 110
+# the referred customers spend less than non-referred customers on average.
+# link to: my method proposed to managers: target high CLV customers by larger coupon given if refer > 1 customers
+```
+
+### active year & referral analysis:
+
+```{r}
+# are referred customers stay longer than non referred customers
+mean(mydata$actyear[mydata$referred == 0])
+mean(mydata$actyear[mydata$referred == 1])
+# the referred customers active less years than non referred customers
+```
+
+```{r}
+# are customers who referred others have longer tenure (yes, 50% more than non-referring customers)
+mean(mydata$actyear[mydata$referring == 0])
+mean(mydata$actyear[mydata$referring == 1])
+```
+
+
+### plot time series of number of normal/referred customers registered
+
+```{r}
+dt2 <- data.table::as.data.table(mydata)
+plotdata2 <- dt2[, .N, by = c('year_sub','month_sub')]
+plotdata2 <-  plotdata2[with(plotdata2, order(year_sub, month_sub)), ]
+plotdata2 <- plotdata2[,3]
+normal_plot <- ts(plotdata2, frequency = 12, start = 2014)
+temdata <- subset(referdata, referred == "1")
+dt <- data.table::as.data.table(temdata)
+plotdata <- dt[, .N, by = c('year_sub','month_sub')]
+plotdata <-  plotdata[with(plotdata, order(year_sub, month_sub)), ]
+plotdata <- plotdata[,3]
+referral_plot <- ts(plotdata, frequency = 12, start = 2014)
+
+# plot the number of customers registered, by year-month
+plot(as.xts(normal_plot), major.format = "%Y-%m")
+# there is a peak on November 2016
+
+# plot the number of referred customers registered, by year-month
+plot(as.xts(referral_plot), major.format = "%Y-%m")
+# there is large peak on November 2016
+
+# plot both of the number of normal/referred customers registered  
+ts.plot(referral_plot, normal_plot, gpars = list(col = c("red", "black")))
+```
+From the plot we can see that the amount of customers registered is slowly decreasing. 
+However, the number of referred customers is slowly increasing, peaked on November in 2016 (when 4849 customers entered through referral). but we will not look into this because we focus on analyze referral behaviors in normal situations.
+
+
+# Calculate CRV of each customer using recursion
+
+```{r}
+# sum excluding the referrer itself
+# define the function "sum_children"
+sum_children <- function(ID, data)
+{
+  result <- 0;
+  children <- which(data$father_ID == ID)
+  if(length(children) == 0) 
+    return(data$totalspend[which(data$ID == ID)])
+  else 
+    for(i in seq_along(children)) 
+      result <- result + sum_children(data$ID[children[i]], data)
+    return(result)
+}
+```
+
+```{r}
+# sum including the referrer itself
+# define the function "sum_children_incl"
+sum_children_incl <- function(ID, data)
+{
+  result <- 0;
+  children <- which(data$father_ID == ID)
+  if(length(children) == 0) 
+    return(data$totalspend[which(data$ID == ID)])
+  else
+    result <- data$totalspend[which(data$ID == ID)]
+    for(i in seq_along(children)) 
+      result <- result + data$totalspend[children[i]]
+    return(result)
+}
+```
+
+```{r}
+# apply the functions on data
+referdata$child_sum <- lapply(referdata$ID, sum_children, referdata)
+referdata$child_sum_incl <- lapply(referdata$ID, sum_children_incl, referdata)
+
+# unlist lists child_sum & child_sum_incl
+referdata$child_sum <- purrr:::reduce(referdata$child_sum, rbind.data.frame) 
+referdata$child_sum_incl <- purrr:::reduce(referdata$child_sum_incl, rbind.data.frame) 
+
+# adjust variable "child_sum"
+referdata$child_sum_adjusted <- ifelse(referdata$child_sum == referdata$child_sum_incl, 0, referdata$child_sum)
+referdata$child_sum <- NULL
+# the variable child_sum_adjusted is the final result of Customer Referral Value
+```
+
+
+```{r}
+# merge one column ("child_sum_adjusted") by FirstOrderDate to mydata table
+mydata.join <- merge(x = mydata, y = referdata[ , c("FirstOrderDate", "child_sum_adjusted")], by = "FirstOrderDate", all.x=TRUE)
+
+# replace NAs in mydata$child_sum_adjusted with 0
+mydata.join[, 30][is.na(mydata.join[, 30])] <- 0
+```
+
+```{r}
+# CRV comparison: referred customers vs. non-referred customers
+mean(mydata.join$child_sum_adjusted[mydata.join$referred == 0])
+mean(mydata.join$child_sum_adjusted[mydata.join$referred == 1])
+```
+
+# who to target for referral program - customers with high CLV?
+
+Question: are customers with high CLV the same as those with high CRV?
+
+customer deciles of CLV (totalspend) and CRV (child_sum_adjusted):
+
+```{r}
+# assign each record with decile based on totalspend (CLV)
+mydata.join$decile <- ntile(mydata.join$totalspend, 10) 
+
+mean(mydata.join$child_sum_adjusted[mydata.join$decile == 1])
+mean(mydata.join$child_sum_adjusted[mydata.join$decile == 2])
+mean(mydata.join$child_sum_adjusted[mydata.join$decile == 3])
+mean(mydata.join$child_sum_adjusted[mydata.join$decile == 4])
+mean(mydata.join$child_sum_adjusted[mydata.join$decile == 5])
+mean(mydata.join$child_sum_adjusted[mydata.join$decile == 6])
+mean(mydata.join$child_sum_adjusted[mydata.join$decile == 7])
+mean(mydata.join$child_sum_adjusted[mydata.join$decile == 8])
+mean(mydata.join$child_sum_adjusted[mydata.join$decile == 9])
+mean(mydata.join$child_sum_adjusted[mydata.join$decile == 10])
+
+mean(mydata.join$totalspend[mydata.join$decile == 1])
+mean(mydata.join$totalspend[mydata.join$decile == 2])
+mean(mydata.join$totalspend[mydata.join$decile == 3])
+mean(mydata.join$totalspend[mydata.join$decile == 4])
+mean(mydata.join$totalspend[mydata.join$decile == 5])
+mean(mydata.join$totalspend[mydata.join$decile == 6])
+mean(mydata.join$totalspend[mydata.join$decile == 7])
+mean(mydata.join$totalspend[mydata.join$decile == 8])
+mean(mydata.join$totalspend[mydata.join$decile == 9])
+mean(mydata.join$totalspend[mydata.join$decile == 10])
+
+# add a decile table of CLV (totalspend) correspond with CRV (child_sum_adjusted)
+```
+
+From the table, we can see that for all customers, customers who have high CLV are those who have high CRV.
+Thus, we can target the referral program on customers who have high CLV (total spending).
+
+Who to target by each customer's CLV? Analysis:
+
+```{r}
+# if target referral campaign on top 10% cusotmer with highest total spend: generate 55% referral value in total
+sum(mydata.join$child_sum_adjusted[mydata.join$totalspend >= 1300])/sum(mydata.join$child_sum_adjusted)
+
+# if target referral campaign on top 10% cusotmer with highest total spend: generate 63% referral value in total
+sum(mydata.join$child_sum_adjusted[mydata.join$totalspend >= 810])/sum(mydata.join$child_sum_adjusted)
+
+# if target referral campaign on top 20% cusotmer with highest total spend: generate 69% referral value in total
+sum(mydata.join$child_sum_adjusted[mydata.join$totalspend >= 560])/sum(mydata.join$child_sum_adjusted)
+
+# if target referral campaign on top 30% cusotmer with highest total spend: generate 77% referral value in total
+sum(mydata.join$child_sum_adjusted[mydata.join$totalspend >= 310])/sum(mydata.join$child_sum_adjusted)
+
+# if target referral campaign on top 40% cusotmer with highest total spend: generate 84% referral value in total
+sum(mydata.join$child_sum_adjusted[mydata.join$totalspend >= 193])/sum(mydata.join$child_sum_adjusted)
+
+# if target referral campaign on top 50% cusotmer with highest total spend: generate 88% referral value in total
+sum(mydata.join$child_sum_adjusted[mydata.join$totalspend >= 127])/sum(mydata.join$child_sum_adjusted)
+
+# if target referral campaign on top 60% cusotmer with highest total spend: generate 91% referral value in total
+sum(mydata.join$child_sum_adjusted[mydata.join$totalspend >= 89])/sum(mydata.join$child_sum_adjusted)
+
+# thus, if we target top 55% customer with highest total spend, we can generate 90% referral value in total.
+```
+
+
+# Rgression Analysis on Customer Referral Value
+
+since we only need to draw inference of the data instead of making predictions, we don't need to make the training/test split and predict.
+
+```{r}
+regr_CRV <- lm(child_sum_adjusted ~ referred + generation + totalspend + optin + year_sub + acquisition_source + gender + region + has_FB_link + sumvdays + sumvfriends + actyear, data=mydata.join)
+summary(regr_CRV)
+# the quality of the model can be analysed by the result of:
+# (to do later): Residuals, Residual standard error, Multiple R-squared, Adjusted R-squared, F-statistic, p-value
+```
+
++ interpret the table, grouping variable into categories. (journal of "Driving profitability by encouraging", p.13)
+
+# ROI analysis for referral campaign
+
+method 1:
+```{r}
+# ROI (for each referred customer, the acquisition cost is 10*2= 20 euros.)
+(mean(mydata$totalspend[mydata$referred == 1])-20)/20
+# the ROI is 10.61, which means with 1 euro invested in referral program, we can get 10.61 euros in return
+# thus, the referral campaign is very profitable (so should target everyone if possible)
+# the source of ROI formula should be attached (citation + reference)
+```
+
+method 2:
+```{r}
+# total profit for referral program
+totalprofit <- sum(mydata$totalspend[mydata$referred == 1])-nrow(mydata[which(mydata$referred ==1),])*20
+totalprofit
+
+# total cost for referral program
+totalcost <- nrow(mydata[which(mydata$referred ==1),])*20
+totalcost
+
+totalprofit/totalcost
+```
+
+# how much percentage of referred customers generate profit for the firm (totalspend > referral cost of 20 euros)
+
+assuming totalspend is after the deduction of 10 euros per referred customer, so we still need to deduct 10 euros (which are rewarded to the refering customer)
+
+```{r}
+nrow(referdata[which(referdata$totalspend > 10 & referdata$referred == 1),])/nrow(referdata[which(referdata$referred == 1),])
+# 80% of referred customers generate profit for the firm, 20% referred customers generate loss for the firm.
+```
+
+```{r}
+ggplot(data = data.frame(referdata[referdata$referred == 1 & referdata$totalspend < 50,]), aes(totalspend-10)) + geom_bar()
+# customers
+```
+
+
+
+
+
+
+
